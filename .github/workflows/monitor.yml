@@ -1,0 +1,58 @@
+name: 배드민턴 접수 모니터링
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: badminton-slot-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: 코드 받기
+        uses: actions/checkout@v4
+
+      - name: Python 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 신청 상태 확인
+        id: monitor
+        run: python monitor.py
+
+      - name: 이전 알림 확인
+        if: steps.monitor.outputs.open_found == 'true'
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh issue list --state open --search '"[배드민턴 알림] 접수 가능" in:title' --json number --jq 'length')
+          echo "exists=$([ "$count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: 접수 가능 알림 만들기
+        if: steps.monitor.outputs.open_found == 'true' && steps.previous.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DETAILS: ${{ steps.monitor.outputs.details }}
+          TARGET_URL: ${{ steps.monitor.outputs.target_url }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          body=$(printf '배드민턴 강좌 신청 버튼이 **접수 종료가 아닌 상태**로 바뀌었습니다.\n\n%s\n\n[지금 신청 페이지 열기](%s)\n\n다음 모집 때 다시 쓰려면 이 이슈를 닫아주세요.' "$DETAILS" "$TARGET_URL")
+          gh issue create \
+            --title '[배드민턴 알림] 접수 가능' \
+            --body "$body" \
+            --assignee "$REPOSITORY_OWNER" || \
+          gh issue create \
+            --title '[배드민턴 알림] 접수 가능' \
+            --body "$body"
