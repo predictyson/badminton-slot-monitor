@@ -4,19 +4,13 @@ import json
 import os
 import ssl
 import sys
-from dataclasses import asdict, dataclass, field
-from html.parser import HTMLParser
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-
-DEFAULT_URL = (
-    "https://yssports.yong-san.or.kr/fmcs/2?"
-    "page=1&lecture_type=R&center=YGSN01&event=1010000000&"
-    "class=1010010000&subject=%EC%9B%94%EC%88%98%EA%B8%88"
-)
+DEFAULT_API_URL = "https://yssports.yong-san.or.kr/rest/lecture/list"
 DEFAULT_TARGET_NUMBERS = ("1", "2")
 CLOSED_TEXT_COMPACT = "접수종료"
 
@@ -26,179 +20,103 @@ class RowStatus:
     number: str
     button_text: str
     href: str
-    classes: tuple[str, ...]
-
-    @property
-    def is_open(self) -> bool:
-        return compact(self.button_text) != CLOSED_TEXT_COMPACT
-
-
-@dataclass
-class HtmlNode:
-    tag: str
-    attrs: dict[str, str]
-    children: list["HtmlNode | str"] = field(default_factory=list)
-
-    def descendants(self) -> Iterable["HtmlNode"]:
-        for child in self.children:
-            if isinstance(child, HtmlNode):
-                yield child
-                yield from child.descendants()
-
-    def text(self) -> str:
-        return "".join(
-            child.text() if isinstance(child, HtmlNode) else child
-            for child in self.children
-        )
-
-
-class HtmlTreeParser(HTMLParser):
-    VOID_TAGS = {
-        "area", "base", "br", "col", "embed", "hr", "img", "input",
-        "link", "meta", "param", "source", "track", "wbr",
-    }
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.root = HtmlNode("document", {})
-        self.stack = [self.root]
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        node = HtmlNode(tag.lower(), {name: value or "" for name, value in attrs})
-        self.stack[-1].children.append(node)
-        if node.tag not in self.VOID_TAGS:
-            self.stack.append(node)
-
-    def handle_startendtag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        node = HtmlNode(tag.lower(), {name: value or "" for name, value in attrs})
-        self.stack[-1].children.append(node)
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        for index in range(len(self.stack) - 1, 0, -1):
-            if self.stack[index].tag == tag:
-                del self.stack[index:]
-                return
-
-    def handle_data(self, data: str) -> None:
-        self.stack[-1].children.append(data)
-
-
-def normalize(value: str) -> str:
-    return " ".join(value.split())
+    is_open: bool
 
 
 def compact(value: str) -> str:
-    return "".join(value.split())
+    return "".join(str(value).split())
 
 
-def parse_target_rows(
-    html: str, target_numbers: Iterable[str] = DEFAULT_TARGET_NUMBERS
-) -> dict[str, RowStatus]:
-    targets = {str(number).strip() for number in target_numbers}
-    parser = HtmlTreeParser()
-    parser.feed(html)
-    found: dict[str, RowStatus] = {}
-
-    rows = (node for node in parser.root.descendants() if node.tag == "tr")
-    for row in rows:
-        row_nodes = list(row.descendants())
-        number_cell = next(
-            (node for node in row_nodes if node.attrs.get("data-title") == "번호"),
-            None,
-        )
-        if not number_cell:
-            continue
-
-        number = normalize(number_cell.text())
-        if number not in targets:
-            continue
-
-        application_cell = next(
-            (node for node in row_nodes if node.attrs.get("data-title") == "신청"),
-            None,
-        )
-        if application_cell and application_cell.tag == "a":
-            link = application_cell
-        elif application_cell:
-            link = next(
-                (node for node in application_cell.descendants() if node.tag == "a"),
-                None,
-            )
-        else:
-            link = None
-        if not link:
-            raise ValueError(f"{number}번 행에서 신청 a 태그를 찾지 못했습니다.")
-
-        button_text = normalize(link.text())
-        if not button_text:
-            raise ValueError(f"{number}번 행의 신청 버튼 텍스트가 비어 있습니다.")
-
-        found[number] = RowStatus(
-            number=number,
-            button_text=button_text,
-            href=link.attrs.get("href", ""),
-            classes=tuple(link.attrs.get("class", "").split()),
-        )
-
-    missing = targets.difference(found)
-    if missing:
-        missing_text = ", ".join(sorted(missing))
-        raise ValueError(
-            f"대상 번호({missing_text})를 찾지 못했습니다. 페이지 구조나 응답을 확인하세요."
-        )
-
-    return found
-
-
-def decode_body(body: bytes, charset: str | None) -> str:
-    candidates = [charset, "utf-8", "cp949", "euc-kr"]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            return body.decode(candidate)
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return body.decode("utf-8", errors="replace")
-
-
-def fetch_page(url: str, timeout_seconds: int = 20) -> str:
+def fetch_lecture_list(
+    url: str,
+    payload_data: dict[str, str],
+    timeout_seconds: int = 20,
+) -> list[dict]:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/128.0.0.0 Safari/537.36"
         ),
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
     }
 
-    request = Request(url, headers=headers)
+    encoded_data = urlencode(payload_data).encode("utf-8")
+    request = Request(url, data=encoded_data, headers=headers, method="POST")
 
-    def read_with_context(context: ssl.SSLContext) -> str:
-        with urlopen(
-            request, timeout=timeout_seconds, context=context
-        ) as response:
-            body = response.read()
-            return decode_body(body, response.headers.get_content_charset())
+    def read_with_context(context: ssl.SSLContext) -> bytes:
+        with urlopen(request, timeout=timeout_seconds, context=context) as response:
+            return response.read()
 
     try:
-        return read_with_context(ssl.create_default_context())
+        body = read_with_context(ssl.create_default_context())
     except URLError as error:
         reason = getattr(error, "reason", error)
-        is_certificate_error = isinstance(reason, ssl.SSLCertVerificationError) or (
+        is_cert_error = isinstance(reason, ssl.SSLCertVerificationError) or (
             "CERTIFICATE_VERIFY_FAILED" in str(reason).upper()
         )
-        if not is_certificate_error:
+        if not is_cert_error:
             raise
+        body = read_with_context(ssl._create_unverified_context())
 
-        # 현재 대상 사이트의 인증서 체인이 일부 실행 환경에서 완전하지 않아
-        # 읽기 전용 GET 요청에 한해서만 인증서 검증 없이 한 번 재시도합니다.
-        return read_with_context(ssl._create_unverified_context())
+    response_json = json.loads(body.decode("utf-8", errors="replace"))
+
+    if isinstance(response_json, list):
+        return response_json
+    if isinstance(response_json, dict):
+        for key in ("list", "data", "rows", "lectureList"):
+            if key in response_json and isinstance(response_json[key], list):
+                return response_json[key]
+    raise ValueError(f"예상치 못한 JSON 응답 구조입니다: {type(response_json)}")
+
+
+def parse_lecture_statuses(
+    lectures: list[dict], target_numbers: tuple[str, ...]
+) -> dict[str, RowStatus]:
+    targets = set(target_numbers)
+    found: dict[str, RowStatus] = {}
+
+    for idx, item in enumerate(lectures, start=1):
+        # API 항목 내 번호 필드가 존재하지 않을 경우 인덱스 순서 사용
+        row_num = str(
+            item.get("row_num")
+            or item.get("num")
+            or item.get("rnum")
+            or idx
+        )
+
+        if row_num not in targets:
+            continue
+
+        # 강좌 상태명을 제공하는 주요 키 검색
+        status_text = str(
+            item.get("state_nm")
+            or item.get("receipt_stat_nm")
+            or item.get("app_stat_nm")
+            or item.get("stat_nm")
+            or item.get("receipt_state")
+            or "알수없음"
+        ).strip()
+
+        is_open = compact(status_text) != CLOSED_TEXT_COMPACT
+
+        found[row_num] = RowStatus(
+            number=row_num,
+            button_text=status_text,
+            href=str(item.get("lecture_code") or item.get("code") or ""),
+            is_open=is_open,
+        )
+
+    missing = targets.difference(found)
+    if missing:
+        missing_text = ", ".join(sorted(missing))
+        raise ValueError(
+            f"대상 번호({missing_text})를 API 응답에서 찾지 못했습니다."
+        )
+
+    return found
 
 
 def write_github_output(name: str, value: str) -> None:
@@ -212,7 +130,7 @@ def write_github_output(name: str, value: str) -> None:
 
 
 def main() -> int:
-    url = os.getenv("TARGET_URL", DEFAULT_URL)
+    api_url = os.getenv("TARGET_API_URL", DEFAULT_API_URL)
     target_numbers = tuple(
         item.strip()
         for item in os.getenv("TARGET_NUMBERS", "1,2").split(",")
@@ -223,31 +141,54 @@ def main() -> int:
         print("TARGET_NUMBERS가 비어 있습니다.", file=sys.stderr)
         return 2
 
+    payload = {
+        "company_code": os.getenv("COMPANY_CODE", "YGSN01"),
+        "mem_no": "",
+        "search_type": "%",
+        "category_cd": os.getenv("CATEGORY_CD", "1010010000"),
+        "category_level": os.getenv("CATEGORY_LEVEL", "2"),
+        "class_nm": "",
+        "train_day": "",
+        "page": "1",
+        "page_size": "10",
+    }
+
     try:
-        html = fetch_page(url)
-        print(f"DEBUG HTML 길이: {len(html)}")
-        print(f"DEBUG HTML 앞부분: {html[:3000]}")
-        statuses = parse_target_rows(html, target_numbers)
-    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        lectures = fetch_lecture_list(api_url, payload)
+        print(f"DEBUG 수신된 강좌 수: {len(lectures)}")
+        if lectures:
+            print(
+                f"DEBUG 첫 번째 강좌 구조: {json.dumps(lectures[0], ensure_ascii=False)}"
+            )
+        statuses = parse_lecture_statuses(lectures, target_numbers)
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"모니터링 실패: {error}", file=sys.stderr)
         return 2
 
     ordered = [statuses[number] for number in target_numbers]
     open_rows = [status for status in ordered if status.is_open]
     details = "\n".join(
-        f"- {status.number}번: {status.button_text}"
-        for status in ordered
+        f"- {status.number}번: {status.button_text}" for status in ordered
     )
 
     write_github_output("open_found", "true" if open_rows else "false")
     write_github_output("details", details)
-    write_github_output("target_url", url)
+    write_github_output(
+        "target_url",
+        os.getenv("TARGET_URL", "https://yssports.yong-san.or.kr/fmcs/2"),
+    )
 
     print(
         json.dumps(
             {
                 "open_found": bool(open_rows),
-                "rows": [asdict(status) | {"is_open": status.is_open} for status in ordered],
+                "rows": [asdict(status) for status in ordered],
             },
             ensure_ascii=False,
             indent=2,
