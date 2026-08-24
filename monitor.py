@@ -11,8 +11,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 DEFAULT_API_URL = "https://yssports.yong-san.or.kr/rest/lecture/list"
-DEFAULT_TARGET_NUMBERS = ("1", "2")
-CLOSED_TEXT_COMPACT = "접수종료"
+DEFAULT_TARGET_CLASS_CODES = ("00146", "00147")
+EXCLUDED_STATUS_TEXTS = {"접수종료", "준비중"}
 
 
 @dataclass(frozen=True)
@@ -73,39 +73,40 @@ def fetch_lecture_list(
 
 
 def parse_lecture_statuses(
-    lectures: list[dict], target_numbers: tuple[str, ...]
+    lectures: list[dict], target_class_codes: tuple[str, ...]
 ) -> dict[str, RowStatus]:
-    targets = set(target_numbers)
+    targets = set(target_class_codes)
     found: dict[str, RowStatus] = {}
 
-    for idx, item in enumerate(lectures, start=1):
-        # API 항목 내 번호 필드가 존재하지 않을 경우 인덱스 순서 사용
-        row_num = str(
-            item.get("row_num")
-            or item.get("num")
-            or item.get("rnum")
-            or idx
-        )
+    status_map = {
+        "R": "접수중",
+        "W": "접수대기",
+        "F": "접수마감",
+        "E": "접수종료",
+        "P": "준비중",
+    }
 
-        if row_num not in targets:
+    for item in lectures:
+        class_cd = str(item.get("class_cd", "")).strip()
+        if class_cd not in targets:
             continue
 
-        # 강좌 상태명을 제공하는 주요 키 검색
-        status_text = str(
-            item.get("state_nm")
-            or item.get("receipt_stat_nm")
-            or item.get("app_stat_nm")
-            or item.get("stat_nm")
-            or item.get("receipt_state")
-            or "알수없음"
-        ).strip()
+        status_code = str(item.get("status", "")).upper()
+        status_text = status_map.get(
+            status_code,
+            str(item.get("state_nm") or item.get("stat_nm") or "알수없음").strip(),
+        )
 
-        is_open = compact(status_text) != CLOSED_TEXT_COMPACT
+        class_nm = str(item.get("class_nm", class_cd)).strip()
+        compact_status = compact(status_text)
 
-        found[row_num] = RowStatus(
-            number=row_num,
-            button_text=status_text,
-            href=str(item.get("lecture_code") or item.get("code") or ""),
+        # 상태 텍스트가 '접수종료' 또는 '준비중'이 아니면 오픈(True) 상태로 판단
+        is_open = compact_status not in EXCLUDED_STATUS_TEXTS
+
+        found[class_cd] = RowStatus(
+            number=class_cd,
+            button_text=f"{class_nm} [{status_text}]",
+            href=class_cd,
             is_open=is_open,
         )
 
@@ -113,7 +114,7 @@ def parse_lecture_statuses(
     if missing:
         missing_text = ", ".join(sorted(missing))
         raise ValueError(
-            f"대상 번호({missing_text})를 API 응답에서 찾지 못했습니다."
+            f"대상 class_cd({missing_text})를 API 응답에서 찾지 못했습니다."
         )
 
     return found
@@ -131,14 +132,14 @@ def write_github_output(name: str, value: str) -> None:
 
 def main() -> int:
     api_url = os.getenv("TARGET_API_URL", DEFAULT_API_URL)
-    target_numbers = tuple(
+    target_class_codes = tuple(
         item.strip()
-        for item in os.getenv("TARGET_NUMBERS", "1,2").split(",")
+        for item in os.getenv("TARGET_CLASS_CODES", "00146,00147").split(",")
         if item.strip()
     )
 
-    if not target_numbers:
-        print("TARGET_NUMBERS가 비어 있습니다.", file=sys.stderr)
+    if not target_class_codes:
+        print("TARGET_CLASS_CODES가 비어 있습니다.", file=sys.stderr)
         return 2
 
     payload = {
@@ -155,12 +156,7 @@ def main() -> int:
 
     try:
         lectures = fetch_lecture_list(api_url, payload)
-        print(f"DEBUG 수신된 강좌 수: {len(lectures)}")
-        if lectures:
-            print(
-                f"DEBUG 첫 번째 강좌 구조: {json.dumps(lectures[0], ensure_ascii=False)}"
-            )
-        statuses = parse_lecture_statuses(lectures, target_numbers)
+        statuses = parse_lecture_statuses(lectures, target_class_codes)
     except (
         HTTPError,
         URLError,
@@ -171,10 +167,10 @@ def main() -> int:
         print(f"모니터링 실패: {error}", file=sys.stderr)
         return 2
 
-    ordered = [statuses[number] for number in target_numbers]
+    ordered = [statuses[code] for code in target_class_codes if code in statuses]
     open_rows = [status for status in ordered if status.is_open]
     details = "\n".join(
-        f"- {status.number}번: {status.button_text}" for status in ordered
+        f"- 코드 {status.number}: {status.button_text}" for status in ordered
     )
 
     write_github_output("open_found", "true" if open_rows else "false")
