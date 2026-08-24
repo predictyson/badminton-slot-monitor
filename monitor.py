@@ -225,6 +225,8 @@ def main() -> int:
 
     try:
         html = fetch_page(url)
+        print(f"DEBUG HTML 길이: {len(html)}")
+        print(f"DEBUG HTML 앞부분: {html[:3000]}")
         statuses = parse_target_rows(html, target_numbers)
     except (HTTPError, URLError, TimeoutError, ValueError) as error:
         print(f"모니터링 실패: {error}", file=sys.stderr)
