@@ -2,7 +2,7 @@ name: 배드민턴 접수 모니터링
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "2-59/5 * * * *"
   workflow_dispatch:
 
 concurrency:
