@@ -1,4 +1,4 @@
-name: 배드민턴 모니터링
+name: Minbot monitoring 
 
 on:
   schedule:
